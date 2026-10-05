@@ -500,7 +500,7 @@
     <div style="padding:14px 16px;">
       <p style="margin:0 0 10px; font-size:12px; color:#556; line-height:1.7;">
         台帳（通勤用定期券購入台帳.xlsx）で「印刷CK」にチェックを入れた人のうち、「未成工事」にチェックが<b>無い</b>人が一覧に表示されます。<br>
-        1人を選んで「転記」すると、明細1～3行目（摘要・支払先・工番・金額）に自動入力します。
+        1人を選んで「転記」すると、明細1～3行目（摘要・支払先・金額）に自動入力します。
       </p>
       <input type="file" id="ledger-file-input" accept=".xlsx,.xlsm,.xls" style="display:none" onchange="onLedgerFileSelected(this)">
       <div style="display:flex; gap:8px; flex-wrap:wrap;">
@@ -1666,7 +1666,7 @@ async function generatePDF(mode = 'download') {
 const LEDGER_HEADERS = {
   check: '印刷CK', name: '氏名', from: '利用区間1', to: '利用区間2', via: '経由',
   months: '期間', start: '開始日', end: '終了日', amount: '金額',
-  misei: '未成工事', job: '工番', project: '件名', note: '備考',
+  misei: '未成工事', note: '備考',
 };
 let ledgerRows = [];
 let ledgerSelectedIdx = -1;
@@ -1726,8 +1726,7 @@ function parseLedgerWorkbook(wb) {
       rows.push({
         sheet: sheetName, rowNo: r + 1,
         name: str('name'), from: str('from'), to: str('to'), via: str('via'),
-        months, start, end, amount,
-        job: str('job'), project: str('project'), note: str('note'),
+        months, start, end, amount, note: str('note'),
       });
     }
   }
@@ -1797,7 +1796,7 @@ function renderLedgerList() {
         <span class="ledger-name">${escapeHtml(r.name)}<br><span style="font-weight:400; font-size:11px; color:#889;">${escapeHtml(r.sheet)} ${r.rowNo}行目</span></span>
         <span class="ledger-detail">
           ${ledgerSummaryLines(r).filter(Boolean).map(escapeHtml).join(' ／ ')}<br>
-          金額 ¥${r.amount.toLocaleString('ja-JP')}${r.job ? ` ／ 工番 ${escapeHtml(r.job)}` : ''}
+          金額 ¥${r.amount.toLocaleString('ja-JP')}
           ${warns.map(w => `<br><span class="ledger-warn">⚠ ${escapeHtml(w)}</span>`).join('')}
         </span>
       </label>`;
@@ -1815,12 +1814,11 @@ function applyLedgerSelection() {
   if (!r) { alert('転記する人を一覧から選んでください'); return; }
   const lines = ledgerSummaryLines(r);
   const summaryIds = lines.map((_, i) => `summary_${i}`);
-  const hasInput = [...summaryIds, 'payee_0', 'job_0', 'amount_0'].some(id => v(id));
+  const hasInput = [...summaryIds, 'payee_0', 'amount_0'].some(id => v(id));
   if (hasInput && !confirm(`明細${lines.length}行目までの摘要などを「${r.name}」の台帳データで上書きします。よろしいですか？`)) return;
 
   lines.forEach((line, i) => { document.getElementById(`summary_${i}`).value = line; });
   document.getElementById('payee_0').value = r.name;
-  document.getElementById('job_0').value = toHalfWidthAlnum(r.job);
   document.getElementById('amount_0').value = r.amount || '';
   updateTotal();
 
