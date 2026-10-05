@@ -1666,7 +1666,7 @@ async function generatePDF(mode = 'download') {
 const LEDGER_HEADERS = {
   check: '印刷CK', name: '氏名', from: '利用区間1', to: '利用区間2', via: '経由',
   months: '期間', start: '開始日', end: '終了日', amount: '金額',
-  misei: '未成工事', note: '備考',
+  misei: '未成工事', issued: '起票済', note: '備考',
 };
 let ledgerRows = [];
 let ledgerSelectedIdx = -1;
@@ -1704,6 +1704,7 @@ const ledgerFmtDate = (d) => d ? `${d.getFullYear()}/${d.getMonth() + 1}/${d.get
 function parseLedgerWorkbook(wb) {
   const rows = [];
   const skipped = [];
+  let issuedCount = 0; // 起票済(伝票作成済み)のため除外した行数
   for (const sheetName of wb.SheetNames) {
     const aoa = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, defval: '', raw: true, blankrows: true });
     const hIdx = aoa.findIndex(r => r.some(c => normLedgerHeader(c) === LEDGER_HEADERS.check));
@@ -1717,6 +1718,8 @@ function parseLedgerWorkbook(wb) {
       const get = (key) => col[key] >= 0 ? row[col[key]] : '';
       const str = (key) => String(get(key) ?? '').trim();
       if (!isLedgerChecked(get('check')) || !str('name')) continue;
+      // 起票済の行は過去の購入履歴なので一覧に出さない(列が無い旧様式の台帳では常に未チェック扱い)
+      if (isLedgerChecked(get('issued'))) { issuedCount++; continue; }
       if (isLedgerChecked(get('misei'))) { skipped.push(str('name')); continue; }
 
       const months = parseInt(str('months')) || 0;
@@ -1730,7 +1733,7 @@ function parseLedgerWorkbook(wb) {
       });
     }
   }
-  return { rows, skipped };
+  return { rows, skipped, issuedCount };
 }
 
 // 明細の摘要（1行目から順に転記）:
@@ -1766,17 +1769,18 @@ async function onLedgerFileSelected(input) {
   if (!file) return;
   try {
     const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
-    const { rows, skipped } = parseLedgerWorkbook(wb);
+    const { rows, skipped, issuedCount } = parseLedgerWorkbook(wb);
     ledgerRows = rows;
     ledgerSelectedIdx = ledgerRows.length === 1 ? 0 : -1;
     renderLedgerList();
     const skippedMsg = skipped.length
       ? ` ※未成工事CKがあるため取り込まなかった人（未成工事用アプリで作成）: ${skipped.join('、')}`
       : '';
+    const issuedMsg = issuedCount ? ` ※起票済のため表示しなかった行: ${issuedCount}件` : '';
     if (ledgerRows.length === 0) {
-      setLedgerStatus('印刷CKにチェックが入っていて、未成工事CKが無い行がありません。※Excelで編集中の場合は保存してから読み込んでください。' + skippedMsg, true);
+      setLedgerStatus('印刷CKにチェックが入っていて、未成工事CKが無い行がありません。※Excelで編集中の場合は保存してから読み込んでください。' + skippedMsg + issuedMsg, true);
     } else {
-      setLedgerStatus(`「${file.name}」から ${ledgerRows.length} 件読み込みました。転記する人を選んでください。` + skippedMsg);
+      setLedgerStatus(`「${file.name}」から ${ledgerRows.length} 件読み込みました。転記する人を選んでください。` + skippedMsg + issuedMsg);
     }
   } catch (e) {
     console.error(e);
