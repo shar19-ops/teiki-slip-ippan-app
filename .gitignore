@@ -1,0 +1,7 @@
+date-stamp.js
+# 通勤用定期券購入台帳など個人情報を含むファイルはコミットしない
+*.xlsx
+*.xls
+*.json
+!manifest.json
+*.pdf
