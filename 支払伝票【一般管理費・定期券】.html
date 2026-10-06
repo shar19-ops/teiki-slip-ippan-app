@@ -499,7 +499,7 @@
     <div class="card-header">▌ 通勤用定期券購入台帳から転記</div>
     <div style="padding:14px 16px;">
       <p style="margin:0 0 10px; font-size:12px; color:#556; line-height:1.7;">
-        台帳（通勤用定期券購入台帳.xlsx）で「印刷CK」にチェックを入れた人のうち、「未成工事」にチェックが<b>無い</b>人が一覧に表示されます。<br>
+        台帳（通勤用定期券購入台帳）のデータベースで「起票済」にチェックが無く、工番が<b>無い</b>行が一覧に表示されます。<br>
         1人を選んで「転記」すると、明細1～3行目（摘要・支払先・金額）に自動入力します。
       </p>
       <input type="file" id="ledger-file-input" accept=".xlsx,.xlsm,.xls" style="display:none" onchange="onLedgerFileSelected(this)">
@@ -1660,13 +1660,13 @@ async function generatePDF(mode = 'download') {
 }
 
 // ─── 通勤用定期券購入台帳からの転記 ──────────────────────────
-// 台帳(xlsx)の各シート(部ごと)から見出し行「印刷CK」を探し、チェックが入った行を一覧化する。
+// 台帳(xlsx/xlsm)の各シートから見出し行(「氏名」と「起票済」を含む行)を探し、対象の行を一覧化する。
 // 列は見出し名で特定するため、列の並び替えや追加があっても動作する。
-// 未成工事CKがある行は未成工事用の定期券アプリ(teiki-slip-app)の対象なので、こちらでは取り込まない。
+// 未成工事の行(v3は工番あり、v2は未成工事CKあり)は未成工事用の定期券アプリ(teiki-slip-app)の対象なので、こちらでは取り込まない。
 const LEDGER_HEADERS = {
   check: '印刷CK', name: '氏名', from: '利用区間1', to: '利用区間2', via: '経由',
   months: '期間', start: '開始日', end: '終了日', amount: '金額',
-  misei: '未成工事', issued: '起票済', note: '備考',
+  misei: '未成工事', issued: '起票済', job: '工番', note: '備考',
 };
 let ledgerRows = [];
 let ledgerSelectedIdx = -1;
@@ -1699,15 +1699,25 @@ function ledgerEndDate(start, months) {
 
 const ledgerFmtDate = (d) => d ? `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}` : '';
 
-// 印刷CKあり・未成工事CKなしの行だけを取り込む。
-// 印刷CKはあるが未成工事CKもある行は未成工事用アプリの対象なので skipped に氏名を集める。
+// 起票済でない行のうち、未成工事でない行(一般管理費)だけを取り込む。
+// v3台帳(データベースシート): 印刷CK・未成工事の列は無く、工番が無い行を一般管理費とみなす。
+// v2台帳(部署別シート): 印刷CKありの行のみ、未成工事は未成工事CKで判定する(後方互換)。
+// 未成工事の行は未成工事用アプリの対象なので skipped に氏名を集める。
 function parseLedgerWorkbook(wb) {
   const rows = [];
   const skipped = [];
   let issuedCount = 0; // 起票済(伝票作成済み)のため除外した行数
-  for (const sheetName of wb.SheetNames) {
-    const aoa = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, defval: '', raw: true, blankrows: true });
-    const hIdx = aoa.findIndex(r => r.some(c => normLedgerHeader(c) === LEDGER_HEADERS.check));
+  let miseiByJob = false; // 未成工事を工番の有無で判定したか(メッセージ用)
+  const sheets = wb.SheetNames.map(name => ({ name, aoa: XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, defval: '', raw: true, blankrows: true }) }));
+  // どれかのシートに「印刷CK」の見出しがあればv2台帳。v2では「印刷CK」のあるシートだけを読む
+  // (v2の期間抽出シートは「氏名」「起票済」を含むが台帳の写しなので読まない)
+  const hasHeader = (r, label) => r.some(c => normLedgerHeader(c) === label);
+  const isV2 = sheets.some(s => s.aoa.some(r => hasHeader(r, LEDGER_HEADERS.check)));
+  for (const { name: sheetName, aoa } of sheets) {
+    // 見出し行: v3は「氏名」と「起票済」を含む行(入力シート・社員CDシートは対象外)、v2は「印刷CK」を含む行
+    const hIdx = aoa.findIndex(r => isV2
+      ? hasHeader(r, LEDGER_HEADERS.check)
+      : hasHeader(r, LEDGER_HEADERS.name) && hasHeader(r, LEDGER_HEADERS.issued));
     if (hIdx < 0) continue;
     const header = aoa[hIdx].map(normLedgerHeader);
     const col = {};
@@ -1717,10 +1727,13 @@ function parseLedgerWorkbook(wb) {
       const row = aoa[r];
       const get = (key) => col[key] >= 0 ? row[col[key]] : '';
       const str = (key) => String(get(key) ?? '').trim();
-      if (!isLedgerChecked(get('check')) || !str('name')) continue;
-      // 起票済の行は過去の購入履歴なので一覧に出さない(列が無い旧様式の台帳では常に未チェック扱い)
+      if (!str('name')) continue;
+      if (col.check >= 0 && !isLedgerChecked(get('check'))) continue; // v2台帳のみ: 印刷CK
+      // 起票済の行は過去の購入履歴なので一覧に出さない
       if (isLedgerChecked(get('issued'))) { issuedCount++; continue; }
-      if (isLedgerChecked(get('misei'))) { skipped.push(str('name')); continue; }
+      if (col.misei < 0) miseiByJob = true;
+      const misei = col.misei >= 0 ? isLedgerChecked(get('misei')) : str('job') !== '';
+      if (misei) { skipped.push(str('name')); continue; }
 
       const months = parseInt(str('months')) || 0;
       const start = ledgerToDate(get('start'));
@@ -1733,7 +1746,7 @@ function parseLedgerWorkbook(wb) {
       });
     }
   }
-  return { rows, skipped, issuedCount };
+  return { rows, skipped, issuedCount, miseiByJob };
 }
 
 // 明細の摘要（1行目から順に転記）:
@@ -1769,16 +1782,16 @@ async function onLedgerFileSelected(input) {
   if (!file) return;
   try {
     const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
-    const { rows, skipped, issuedCount } = parseLedgerWorkbook(wb);
+    const { rows, skipped, issuedCount, miseiByJob } = parseLedgerWorkbook(wb);
     ledgerRows = rows;
     ledgerSelectedIdx = ledgerRows.length === 1 ? 0 : -1;
     renderLedgerList();
     const skippedMsg = skipped.length
-      ? ` ※未成工事CKがあるため取り込まなかった人（未成工事用アプリで作成）: ${skipped.join('、')}`
+      ? ` ※${miseiByJob ? '工番がある' : '未成工事CKがある'}ため取り込まなかった人（未成工事用アプリで作成）: ${skipped.join('、')}`
       : '';
     const issuedMsg = issuedCount ? ` ※起票済のため表示しなかった行: ${issuedCount}件` : '';
     if (ledgerRows.length === 0) {
-      setLedgerStatus('印刷CKにチェックが入っていて、未成工事CKが無い行がありません。※Excelで編集中の場合は保存してから読み込んでください。' + skippedMsg + issuedMsg, true);
+      setLedgerStatus('起票済でない一般管理費の行（工番なし）がありません。※Excelで編集中の場合は保存してから読み込んでください。' + skippedMsg + issuedMsg, true);
     } else {
       setLedgerStatus(`「${file.name}」から ${ledgerRows.length} 件読み込みました。転記する人を選んでください。` + skippedMsg + issuedMsg);
     }
