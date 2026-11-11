@@ -1773,6 +1773,25 @@ let ledgerSelected = new Set(); // 一覧で選択中の行(ledgerRowsの添字)
 
 const normLedgerHeader = (s) => String(s ?? '').replace(/[\s　]/g, '');
 
+// 払戻の行（金額がマイナス、または備考に「払戻」「払い戻」）は入金伝票（定期券）アプリ(teiki-deposit-slip-app)の対象なので取り込まない。
+// 判定は入金伝票（定期券）アプリの parseLedgerWorkbook / ledgerAmount と同じ。
+const REFUND_WORD = /払戻|払い戻/;
+
+// 台帳の金額 → { signed: 符号付きの値, abs: マイナスを外した値 }
+// 数値はそのまま。文字列は全角数字・「－」「▲」「△」「(1,000)」などのマイナス表記にも対応
+function ledgerAmount(val) {
+  if (typeof val === 'number') {
+    const n = Math.round(val);
+    return { signed: n, abs: Math.abs(n) };
+  }
+  const s = String(val ?? '').trim()
+    .replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+  const digits = s.replace(/[^\d]/g, '');
+  const abs = parseInt(digits) || 0;
+  const neg = /^[-−－‐ー▲△]/.test(s) || /^[(（].*[)）]$/.test(s);
+  return { signed: neg ? -abs : abs, abs };
+}
+
 function isLedgerChecked(val) {
   if (val === true || val === 1) return true;
   return /^(true|1|✓|✔|○|〇|ﾚ|レ)$/i.test(String(val ?? '').trim());
@@ -1807,6 +1826,7 @@ function parseLedgerWorkbook(wb) {
   const rows = [];
   const skipped = [];
   let issuedCount = 0; // 起票済(伝票作成済み)のため除外した行数
+  let refundCount = 0; // 払戻(入金伝票（定期券）アプリの対象)のため除外した行数
   let miseiByJob = false; // 未成工事を工番の有無で判定したか(メッセージ用)
   const sheets = wb.SheetNames.map(name => ({ name, aoa: XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, defval: '', raw: true, blankrows: true }) }));
   // どれかのシートに「印刷CK」の見出しがあればv2台帳。v2では「印刷CK」のあるシートだけを読む
@@ -1831,6 +1851,9 @@ function parseLedgerWorkbook(wb) {
       if (col.check >= 0 && !isLedgerChecked(get('check'))) continue; // v2台帳のみ: 印刷CK
       // 起票済の行は過去の購入履歴なので一覧に出さない
       if (isLedgerChecked(get('issued'))) { issuedCount++; continue; }
+      // 払戻の行は入金伝票（定期券）アプリで作成するので一覧に出さない
+      const amt = ledgerAmount(get('amount'));
+      if (amt.signed < 0 || REFUND_WORD.test(str('note'))) { refundCount++; continue; }
       if (col.misei < 0) miseiByJob = true;
       const misei = col.misei >= 0 ? isLedgerChecked(get('misei')) : str('job') !== '';
       if (misei) { skipped.push(str('name')); continue; }
@@ -1838,7 +1861,7 @@ function parseLedgerWorkbook(wb) {
       const months = parseInt(str('months')) || 0;
       const start = ledgerToDate(get('start'));
       const end = ledgerToDate(get('end')) || (start && months ? ledgerEndDate(start, months) : null);
-      const amount = parseInt(String(get('amount')).replace(/[^\d]/g, '')) || 0;
+      const amount = amt.abs;
       rows.push({
         sheet: sheetName, rowNo: r + 1,
         name: str('name'), from: str('from'), to: str('to'), via: str('via'),
@@ -1846,7 +1869,7 @@ function parseLedgerWorkbook(wb) {
       });
     }
   }
-  return { rows, skipped, issuedCount, miseiByJob };
+  return { rows, skipped, issuedCount, refundCount, miseiByJob };
 }
 
 // 明細の摘要（1行目から順に転記）:
@@ -1882,14 +1905,15 @@ async function onLedgerFileSelected(input) {
   if (!file) return;
   try {
     const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
-    const { rows, skipped, issuedCount, miseiByJob } = parseLedgerWorkbook(wb);
+    const { rows, skipped, issuedCount, refundCount, miseiByJob } = parseLedgerWorkbook(wb);
     ledgerRows = rows;
     ledgerSelected = new Set(ledgerRows.map((_, i) => i)); // 読み込んだ全員を選択した状態にする
     renderLedgerList();
     const skippedMsg = skipped.length
       ? ` ※${miseiByJob ? '工番がある' : '未成工事CKがある'}ため取り込まなかった人（未成工事用アプリで作成）: ${skipped.join('、')}`
       : '';
-    const issuedMsg = issuedCount ? ` ※起票済のため表示しなかった行: ${issuedCount}件` : '';
+    const issuedMsg = (issuedCount ? ` ※起票済のため表示しなかった行: ${issuedCount}件` : '')
+      + (refundCount ? ` ※払戻のため表示しなかった行: ${refundCount}件（入金伝票（定期券）アプリで作成）` : '');
     if (ledgerRows.length === 0) {
       setLedgerStatus('起票済でない一般管理費の行（工番なし）がありません。※Excelで編集中の場合は保存してから読み込んでください。' + skippedMsg + issuedMsg, true);
     } else {
