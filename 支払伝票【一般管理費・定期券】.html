@@ -535,12 +535,16 @@
     <div style="padding:14px 16px;">
       <p style="margin:0 0 10px; font-size:12px; color:#556; line-height:1.7;">
         台帳（通勤用定期券購入台帳）のデータベースで「起票済」にチェックが無く、工番が<b>無い</b>行が一覧に表示されます。<br>
-        1人を選んで「転記」すると、明細1～3行目（摘要・支払先・金額）に自動入力します。
+        1人を選んで「転記」すると、明細1～3行目（摘要・支払先・金額）に自動入力します。<br>
+        複数人を選んで「まとめて印刷」すると、1人1枚の伝票をA4に2人分ずつ並べて出力します（事業所・日付・発行者などは画面の入力内容を全員に使います。領収書・添付ファイルは付きません）。
       </p>
       <input type="file" id="ledger-file-input" accept=".xlsx,.xlsm,.xls" style="display:none" onchange="onLedgerFileSelected(this)">
       <div style="display:flex; gap:8px; flex-wrap:wrap;">
         <button type="button" class="btn-scan" onclick="document.getElementById('ledger-file-input').click()">📗 台帳を読み込む</button>
-        <button type="button" class="btn-scan" id="ledger-apply-btn" style="display:none;" onclick="applyLedgerSelection()">⬇ 選択した人を転記</button>
+        <button type="button" class="btn-scan ledger-only" style="display:none;" onclick="toggleLedgerAll()">☑ 全員を選択／解除</button>
+        <button type="button" class="btn-scan ledger-only" id="ledger-apply-btn" style="display:none;" onclick="applyLedgerSelection()">⬇ 選択した人を転記</button>
+        <button type="button" class="btn-scan ledger-only" style="display:none;" onclick="batchLedgerExport('print')">🖨 選択した人をまとめて印刷</button>
+        <button type="button" class="btn-scan ledger-only" style="display:none;" onclick="batchLedgerExport('download')">📄 まとめてPDF</button>
       </div>
       <p id="ledger-status"></p>
       <div id="ledger-list"></div>
@@ -1257,7 +1261,8 @@ function applyFormData(data) {
 // 保存・PDF出力時のファイル名候補: 定期_一般_支払先_発行日(YYMMDD)
 // 支払先は明細№1の支払先（購入者の氏名）から空白とファイル名に使えない文字を除いたもの。未入力なら省略
 // 発行日が未入力なら今日の日付
-function buildFileBaseName() {
+// まとめて出力(batchRows)のときは「1人目の氏名＋他N名」を支払先の部分に使う
+function buildFileBaseName(batchRows) {
   const y = v('issue_year'), m = v('issue_month'), d = v('issue_day');
   const pad2 = (n) => String(n).padStart(2, '0');
   let date;
@@ -1267,7 +1272,11 @@ function buildFileBaseName() {
     const t = new Date();
     date = pad2(t.getFullYear() % 100) + pad2(t.getMonth() + 1) + pad2(t.getDate());
   }
-  const payee = gv('payee_0').replace(/[\s　\\/:*?"<>|]/g, '');
+  const clean = (s) => String(s || '').replace(/[\s　\\/:*?"<>|]/g, '');
+  let payee = clean(gv('payee_0'));
+  if (batchRows && batchRows.length) {
+    payee = clean(batchRows[0].name) + (batchRows.length > 1 ? `他${batchRows.length - 1}名` : '');
+  }
   return ['定期', '一般', payee, date].filter(Boolean).join('_');
 }
 
@@ -1350,7 +1359,8 @@ async function printViaCanvas(pdfBytes, title) {
 }
 
 // ─── PDF生成 ─────────────────────────────────────────────────
-async function generatePDF(mode = 'download') {
+// batchRows: 台帳の行の配列を渡すと、1人1枚の伝票をA4に2人分ずつ並べて出力する（領収書・添付ファイルなし）
+async function generatePDF(mode = 'download', batchRows = null) {
   const statusEl = document.getElementById('status');
   statusEl.textContent = 'PDFを生成中...';
   statusEl.className = '';
@@ -1404,7 +1414,7 @@ async function generatePDF(mode = 'download') {
 
     const A4_W = 595.32, A4_H = 841.92;
     const A5_W = 595.32, A5_H = 419.52;
-    const a4Page = a4Doc.addPage([A4_W, A4_H]);
+    let a4Page = null; // 描画中のA4ページ（まとめて出力では2人ごとに新しいページ）
     const fs = 11;
     // 「発行者　㊞」欄の空きスペースの中心座標（テンプレートPDFを画像化して実測。上の合計欄の枠線・下の経理部枠線に当たらない範囲）
     // サイズ1.2倍化に合わせて左に5mm(約14.17pt)移動
@@ -1600,43 +1610,73 @@ async function generatePDF(mode = 'download') {
     // A4上半分に伝票を描画
     // テンプレートは上端ぎりぎり(約3.7mm)まで印字があり、プリンタの印刷不可領域で事業所名の上部が欠けるため、
     // 伝票全体を縮小して上に余白を取り、左右中央に配置する（下端は切取り線より上に収まる）
+    // まとめて出力の2人目(A4下半分)は、未成工事用・控えと同じく下端から余白を取る
     const slotY = A4_H - A5_H;
     const SLIP_SCALE = 0.97;
-    const SLIP_TOP_MARGIN = 9; // pt（約3.2mm）
+    const SLIP_TOP_MARGIN = 9;     // pt（約3.2mm）上の伝票の上端余白
+    const SLIP_BOTTOM_MARGIN = 12; // pt（約4.2mm）下の伝票の下端余白
     const slipTx = (A4_W - A5_W * SLIP_SCALE) / 2;
-    const slipTy = A4_H - SLIP_TOP_MARGIN - A4_H * SLIP_SCALE;
-    a4Page.pushOperators(
-      PDFLib.pushGraphicsState(),
-      PDFLib.concatTransformationMatrix(SLIP_SCALE, 0, 0, SLIP_SCALE, slipTx, slipTy)
-    );
-    a4Page.drawPage(templatePage, { x: 0, y: slotY, width: A5_W, height: A5_H });
-    drawAt(slotY);
-    a4Page.pushOperators(PDFLib.popGraphicsState());
+    const slipTy = (yOffset) => yOffset > 0 ? A4_H - SLIP_TOP_MARGIN - A4_H * SLIP_SCALE : SLIP_BOTTOM_MARGIN;
+    const placeSlip = (yOffset) => {
+      a4Page.pushOperators(
+        PDFLib.pushGraphicsState(),
+        PDFLib.concatTransformationMatrix(SLIP_SCALE, 0, 0, SLIP_SCALE, slipTx, slipTy(yOffset))
+      );
+      a4Page.drawPage(templatePage, { x: 0, y: yOffset, width: A5_W, height: A5_H });
+      drawAt(yOffset);
+      a4Page.pushOperators(PDFLib.popGraphicsState());
+    };
 
     // 中央に切取り線を描画
     const cutY = slotY;
-    const cutClr = PDFLib.rgb(0.5, 0.5, 0.5);
-    const cutLabel = '切取り';
-    const cutLabelSize = 7.5;
-    const cutLabelW = jpFont.widthOfTextAtSize(cutLabel, cutLabelSize);
-    const cutLabelX = (A4_W - cutLabelW) / 2;
-    const dashLen = 9, dashGap = 5;
-    let cx = 4;
-    while (cx < cutLabelX - 6) {
-      const ex = Math.min(cx + dashLen, cutLabelX - 6);
-      a4Page.drawLine({ start: { x: cx, y: cutY }, end: { x: ex, y: cutY }, thickness: 0.5, color: cutClr });
-      cx = ex + dashGap;
-    }
-    a4Page.drawText(cutLabel, { x: cutLabelX, y: cutY - cutLabelSize * 0.4, size: cutLabelSize, font: jpFont, color: cutClr });
-    cx = cutLabelX + cutLabelW + 6;
-    while (cx < A4_W - 4) {
-      const ex = Math.min(cx + dashLen, A4_W - 4);
-      a4Page.drawLine({ start: { x: cx, y: cutY }, end: { x: ex, y: cutY }, thickness: 0.5, color: cutClr });
-      cx = ex + dashGap;
+    const drawCutLine = () => {
+      const cutClr = PDFLib.rgb(0.5, 0.5, 0.5);
+      const cutLabel = '切取り';
+      const cutLabelSize = 7.5;
+      const cutLabelW = jpFont.widthOfTextAtSize(cutLabel, cutLabelSize);
+      const cutLabelX = (A4_W - cutLabelW) / 2;
+      const dashLen = 9, dashGap = 5;
+      let cx = 4;
+      while (cx < cutLabelX - 6) {
+        const ex = Math.min(cx + dashLen, cutLabelX - 6);
+        a4Page.drawLine({ start: { x: cx, y: cutY }, end: { x: ex, y: cutY }, thickness: 0.5, color: cutClr });
+        cx = ex + dashGap;
+      }
+      a4Page.drawText(cutLabel, { x: cutLabelX, y: cutY - cutLabelSize * 0.4, size: cutLabelSize, font: jpFont, color: cutClr });
+      cx = cutLabelX + cutLabelW + 6;
+      while (cx < A4_W - 4) {
+        const ex = Math.min(cx + dashLen, A4_W - 4);
+        a4Page.drawLine({ start: { x: cx, y: cutY }, end: { x: ex, y: cutY }, thickness: 0.5, color: cutClr });
+        cx = ex + dashGap;
+      }
+    };
+
+    if (batchRows) {
+      // 台帳の1人ずつを画面の欄に一時的に差し込んで描画し、最後に画面の入力内容を元に戻す
+      const savedIds = [];
+      for (let i = 0; i < NUM_ROWS; i++) savedIds.push(`summary_${i}`, `payee_${i}`, `amount_${i}`);
+      const saved = savedIds.map(id => [id, document.getElementById(id).value]);
+      try {
+        batchRows.forEach((r, i) => {
+          if (i % 2 === 0) {
+            a4Page = a4Doc.addPage([A4_W, A4_H]);
+            drawCutLine();
+          }
+          setLedgerRowToForm(r);
+          placeSlip(i % 2 === 0 ? slotY : 0);
+        });
+      } finally {
+        saved.forEach(([id, val]) => { document.getElementById(id).value = val; });
+        updateTotal();
+      }
+    } else {
+      a4Page = a4Doc.addPage([A4_W, A4_H]);
+      placeSlip(slotY);
+      drawCutLine();
     }
 
     // A4下半分に1枚目の領収書を描画
-    if (receiptImages.length > 0) {
+    if (!batchRows && receiptImages.length > 0) {
       const r0 = receiptImages[0].dataUrl;
       const isJpeg0 = r0.startsWith('data:image/jpeg');
       const rcptBytes0 = Uint8Array.from(atob(r0.split(',')[1]), c => c.charCodeAt(0));
@@ -1649,7 +1689,7 @@ async function generatePDF(mode = 'download') {
       });
     }
     // 2枚目以降: A5ページに2×2グリッドでまとめて出力
-    if (receiptImages.length > 1) {
+    if (!batchRows && receiptImages.length > 1) {
       const A5W = 420, A5H = 595;
       const marg = 15, gap = 8, cols = 2, rows = 2;
       const cellW = (A5W - 2*marg - (cols-1)*gap) / cols;
@@ -1680,7 +1720,7 @@ async function generatePDF(mode = 'download') {
 
     // ─ 添付ファイル: PDFページを結合 ─
     const attachMergeWarnings = [];
-    for (const f of attachedFiles) {
+    for (const f of (batchRows ? [] : attachedFiles)) {
       try {
         const attachBytes = Uint8Array.from(atob(f.dataUrl.split(',')[1]), c => c.charCodeAt(0));
         const attachDoc = await PDFDocument.load(attachBytes);
@@ -1694,20 +1734,22 @@ async function generatePDF(mode = 'download') {
       ? `（添付ファイルの結合に失敗: ${attachMergeWarnings.join(', ')}）`
       : '';
 
-        const outBytes = await a4Doc.save();
+    const outBytes = await a4Doc.save();
+    const baseName = buildFileBaseName(batchRows);
+    const batchMsg = batchRows ? `（${batchRows.length}人分）` : '';
     if (mode === 'print') {
-      await printViaCanvas(outBytes, buildFileBaseName());
-      statusEl.textContent = '印刷ダイアログを開きました' + attachWarningMsg;
+      await printViaCanvas(outBytes, baseName);
+      statusEl.textContent = '印刷ダイアログを開きました' + batchMsg + attachWarningMsg;
       statusEl.className = attachWarningMsg ? 'status-err' : 'status-ok';
     } else {
       const blob = new Blob([outBytes], { type: 'application/pdf' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${buildFileBaseName()}.pdf`;
+      a.download = `${baseName}.pdf`;
       a.click();
       URL.revokeObjectURL(url);
-      statusEl.textContent = 'PDF出力完了！' + attachWarningMsg;
+      statusEl.textContent = 'PDF出力完了！' + batchMsg + attachWarningMsg;
       statusEl.className = attachWarningMsg ? 'status-err' : 'status-ok';
     }
   } catch (err) {
@@ -1727,7 +1769,7 @@ const LEDGER_HEADERS = {
   misei: '未成工事', issued: '起票済', job: '工番', note: '備考',
 };
 let ledgerRows = [];
-let ledgerSelectedIdx = -1;
+let ledgerSelected = new Set(); // 一覧で選択中の行(ledgerRowsの添字)
 
 const normLedgerHeader = (s) => String(s ?? '').replace(/[\s　]/g, '');
 
@@ -1842,7 +1884,7 @@ async function onLedgerFileSelected(input) {
     const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
     const { rows, skipped, issuedCount, miseiByJob } = parseLedgerWorkbook(wb);
     ledgerRows = rows;
-    ledgerSelectedIdx = ledgerRows.length === 1 ? 0 : -1;
+    ledgerSelected = new Set(ledgerRows.map((_, i) => i)); // 読み込んだ全員を選択した状態にする
     renderLedgerList();
     const skippedMsg = skipped.length
       ? ` ※${miseiByJob ? '工番がある' : '未成工事CKがある'}ため取り込まなかった人（未成工事用アプリで作成）: ${skipped.join('、')}`
@@ -1851,7 +1893,7 @@ async function onLedgerFileSelected(input) {
     if (ledgerRows.length === 0) {
       setLedgerStatus('起票済でない一般管理費の行（工番なし）がありません。※Excelで編集中の場合は保存してから読み込んでください。' + skippedMsg + issuedMsg, true);
     } else {
-      setLedgerStatus(`「${file.name}」から ${ledgerRows.length} 件読み込みました。転記する人を選んでください。` + skippedMsg + issuedMsg);
+      setLedgerStatus(`「${file.name}」から ${ledgerRows.length} 件読み込みました（全員を選択済み）。1人を転記するか、選択した人をまとめて印刷できます。`+ skippedMsg + issuedMsg);
     }
   } catch (e) {
     console.error(e);
@@ -1865,9 +1907,10 @@ function renderLedgerList() {
   const list = document.getElementById('ledger-list');
   list.innerHTML = ledgerRows.map((r, idx) => {
     const warns = ledgerWarnings(r);
+    const sel = ledgerSelected.has(idx);
     return `
-      <label class="ledger-item${idx === ledgerSelectedIdx ? ' selected' : ''}" ondblclick="applyLedgerSelection()">
-        <input type="radio" name="ledger_pick" ${idx === ledgerSelectedIdx ? 'checked' : ''} onchange="selectLedgerRow(${idx})">
+      <label class="ledger-item${sel ? ' selected' : ''}" ondblclick="applyLedgerSelection(${idx})">
+        <input type="checkbox" ${sel ? 'checked' : ''} onchange="selectLedgerRow(${idx}, this.checked)">
         <span class="ledger-name">${escapeHtml(r.name)}<br><span style="font-weight:400; font-size:11px; color:#889;">${escapeHtml(r.sheet)} ${r.rowNo}行目</span></span>
         <span class="ledger-detail">
           ${ledgerSummaryLines(r).filter(Boolean).map(escapeHtml).join(' ／ ')}<br>
@@ -1876,16 +1919,50 @@ function renderLedgerList() {
         </span>
       </label>`;
   }).join('');
-  document.getElementById('ledger-apply-btn').style.display = ledgerRows.length ? 'inline-flex' : 'none';
+  document.querySelectorAll('.ledger-only').forEach(el => { el.style.display = ledgerRows.length ? 'inline-flex' : 'none'; });
 }
 
-function selectLedgerRow(idx) {
-  ledgerSelectedIdx = idx;
-  document.querySelectorAll('#ledger-list .ledger-item').forEach((el, i) => el.classList.toggle('selected', i === idx));
+function selectLedgerRow(idx, checked) {
+  if (checked) ledgerSelected.add(idx); else ledgerSelected.delete(idx);
+  document.querySelectorAll('#ledger-list .ledger-item').forEach((el, i) => el.classList.toggle('selected', ledgerSelected.has(i)));
 }
 
-function applyLedgerSelection() {
-  const r = ledgerRows[ledgerSelectedIdx];
+// 全員選択済みなら全解除、そうでなければ全員を選択
+function toggleLedgerAll() {
+  ledgerSelected = ledgerSelected.size === ledgerRows.length ? new Set() : new Set(ledgerRows.map((_, i) => i));
+  renderLedgerList();
+}
+
+// まとめて出力用: 台帳の1人分を画面の欄に入れる（確認なし）。明細の摘要・支払先・金額は全行を置き換える
+function setLedgerRowToForm(r) {
+  const lines = ledgerSummaryLines(r);
+  for (let i = 0; i < NUM_ROWS; i++) {
+    document.getElementById(`summary_${i}`).value = lines[i] || '';
+    document.getElementById(`payee_${i}`).value = i === 0 ? r.name : '';
+    document.getElementById(`amount_${i}`).value = i === 0 ? (r.amount || '') : '';
+  }
+}
+
+// 選択した人の伝票をまとめて印刷・PDF出力（A4に2人分ずつ）
+function batchLedgerExport(mode) {
+  const rows = ledgerRows.filter((_, i) => ledgerSelected.has(i));
+  if (!rows.length) { alert('まとめて出力する人を一覧から選んでください'); return; }
+  const warnLines = rows.map(r => ({ r, w: ledgerWarnings(r) })).filter(x => x.w.length)
+    .map(x => `・${x.r.name}: ${x.w.join(' / ')}`);
+  if (warnLines.length && !confirm(`次の人は台帳に未入力の項目があります。このまま出力しますか？\n\n${warnLines.join('\n')}`)) return;
+  generatePDF(mode, rows);
+}
+
+// idx を渡すと（一覧のダブルクリック）その人を転記。ボタンからは選択中の1人を転記
+function applyLedgerSelection(idx) {
+  if (idx === undefined) {
+    if (ledgerSelected.size !== 1) {
+      alert(ledgerSelected.size ? '転記できるのは1人だけです。1人だけ選ぶか、「まとめて印刷」を使ってください。' : '転記する人を一覧から選んでください');
+      return;
+    }
+    idx = [...ledgerSelected][0];
+  }
+  const r = ledgerRows[idx];
   if (!r) { alert('転記する人を一覧から選んでください'); return; }
   const lines = ledgerSummaryLines(r);
   const summaryIds = lines.map((_, i) => `summary_${i}`);
